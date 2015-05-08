@@ -1,0 +1,580 @@
+#!/usr/bin/python
+#
+# Test program to verify that NIS functions properly.
+#
+# Currently, this tests:
+#
+#  - different binding modes configured via yp.conf
+#  - ypcat, ypmatch
+#  - nss integration of hosts, passwd, group
+#  - PAM integration (authentication, passwd change)
+#
+# Things not covered yet
+#  - IPv6
+#  - master/slave setups
+#  - SLP binding
+#  - ypbind fallback to broadcast if a configured
+#    server cannot be found
+#  - unbinding when the server goes away
+#  - ypset
+#
+# Copyright (C) 2015 Olaf Kirch <okir@suse.de>
+#
+
+import sys
+import suselog
+import twopence
+import susetest
+
+
+journal = None
+client = None
+server = None
+rpcinfo = None
+nisdomain = "nistest.opensuse.org"
+
+def setup():
+	global client, server, journal
+
+	config = susetest.Config("nis")
+
+	journal = config.journal
+
+	journal.beginGroup("setup")
+
+	client = susetest.Target(config.node("client"))
+	server = susetest.Target(config.node("server"))
+
+	if not client.ipaddr:
+		journal.fatal("No IP address set for client");
+	if not server.ipaddr:
+		journal.fatal("No IP address set for server");
+
+	if not server.configureOtherNetworks():
+		journal.fatal("Unable to configure additional networks")
+	if not client.configureOtherNetworks():
+		journal.fatal("Unable to configure additional networks")
+
+##################################################################
+# Start ypserv and run some sanity checks
+##################################################################
+def nis_init_server(server):
+	global journal
+
+	journal.beginGroup("init-%s" % server.name, "initialize server")
+
+	journal.beginTest(None, "Preparing configuration")
+
+	journal.info("set the NIS domain to %s" % nisdomain)
+	if not server.runOrFail("nisdomainname '%s'" % nisdomain):
+		return False
+
+	journal.info("Set the host name to nismaster")
+	server.addHostEntry(server.ipaddr, "nismaster.testing.suse.org")
+	server.run("hostname nismaster")
+
+	journal.beginTest(None, "building default NIS maps")
+	if not server.runOrFail("make -C /var/yp"):
+		return False
+
+	journal.beginTest(None, "starting ypserv")
+	if not server.runOrFail("rcypserv start"):
+		return False
+
+	journal.beginTest(None, "starting yppasswdd")
+	if not server.runOrFail("rcyppasswdd start"):
+		return False
+
+	journal.beginTest(None, "ensure ypserv is running")
+	if not server.runOrFail("rpcinfo -u localhost ypserv"):
+		return False
+
+	journal.beginTest(None, "ensure yppasswdd is running")
+	if not server.runOrFail("rpcinfo -u localhost yppasswdd"):
+		return False
+
+	journal.finishGroup()
+
+##################################################################
+# Start ypbind and run some sanity checks
+##################################################################
+def nis_init_client(client, serverip):
+	global journal
+
+	journal.beginGroup("init-%s" % client.name, "initialize client")
+
+	# Very important caveat: We need to start rpcbind before enabling NIS.
+	# Otherwise, rpcbind will hang on startup (NIS domain already set,
+	# so getaddrinfo(3) will try to do a NIS query, and thus tries to ask
+	# rpcbind to resolve service names such as rpcbind. Bleah.
+	journal.beginTest(None, "start rpcbind")
+	if not client.runOrFail("systemctl enable rpcbind.socket") or \
+	   not client.runOrFail("systemctl start rpcbind.socket"):
+		return False
+
+	journal.beginTest(None, "Preparing configuration")
+
+	journal.info("Set NIS domain to %s" % nisdomain)
+	if not client.sendbuffer("/etc/defaultdomain", nisdomain):
+		return False
+
+	journal.info("Set the host name to nismaster")
+	client.addHostEntry(serverip, "nismaster.testing.suse.org")
+
+	client.nisBound = False
+	return True
+
+##################################################################
+# Test various ways to configure ypbind
+##################################################################
+def nis_test_binding(client, serverip):
+
+	global nisdomain
+
+	journal.beginGroup("ypbind", "Test different ypbind configuration modes")
+
+	list = []
+	list.append("domain %s broadcast" % nisdomain)
+	list.append("broadcast")
+	list.append("domain %s server %s" % (nisdomain, serverip))
+	list.append("ypserver %s" % serverip)
+
+	for ypconf in list:
+		journal.beginTest(None, "validate binding when using \"%s\"" % ypconf)
+		nis_configure_binding(client, ypconf, serverip)
+
+	# TBD: use "ypwhich -m rpc" and verify that the name of the master
+	# returned is nismaster.testing.suse.de
+
+def nis_ensure_bound(client):
+
+	if client.nisBound:
+		return True
+
+	journal.beginTest(None, "binding client to NIS server")
+	ypconf = "domain %s server %s" % (nisdomain, serverip)
+	nis_configure_binding(client, ypconf, serverip)
+
+	return client.nisBound
+
+##################################################################
+# Update yp.conf and rebind
+##################################################################
+def nis_configure_binding(client, ypconf, serverip):
+
+	journal.info("Updating yp.conf")
+	if not client.sendbuffer("/etc/yp.conf", ypconf):
+		return False
+
+	# FIXME: do we need to clean out the binding directory?
+
+	journal.info("Restart ypbind")
+	client.nisBound = False
+	if not client.runOrFail("rcypbind restart"):
+		return False
+
+	journal.info("Verify client binding")
+	bound = None
+	for i in range(1, 120/5):
+		st = client.run("ypwhich")
+		if not st:
+			journal.failure("ypwhich failed")
+			return False
+
+		bound = str(st.stdout);
+		if bound:
+			break
+
+		time.slep(5)
+
+	if not bound:
+		journal.failure("failed to bind to server")
+		return False
+
+	# It would be nice to verify whether we've bound to the
+	# expected server or not. However, ypwhich returns the
+	# hostname rather than the address.
+	# We could use "getent -s files host <ipaddr>" to
+	# map the address to the hostname, and match those,
+	# but this looks like a lot of work for minimal gain.
+	# After all, there should be only one such server on the
+	# network in this test environment.
+	journal.success("Successfully bound to %s" % bound)
+	client.nisBound = True
+	return True
+
+##################################################################
+# Enable passwd and group compat lookups
+##################################################################
+def nis_enable_compat_lookups(client, mapname):
+	
+	global journal
+
+	filename = "/etc/" + mapname
+
+	if not nsswitch_set_method(client, mapname, "compat"):
+		return False
+
+	journal.beginTest(None, "add + entry to %s" % filename)
+	data = client.recvbuffer(filename)
+	if not data:
+		return False
+
+	result = []
+	for line in str(data).strip().split('\n'):
+		if line[0] == '+':
+			# In theory, this could be a +kukuk, but that's not the default
+			# we ship :-)
+			journal.success("%s already contains a line starting with +" % filename);
+			return True
+		result.append(line)
+	
+	result.append("+")
+
+	data = '\n'.join(result) + '\n'
+	return client.sendbuffer(filename, data);
+
+##################################################################
+# Enable password updates through NIS
+##################################################################
+def nis_pam_unix_enable(client, filename):
+
+	global journal
+
+	journal.beginTest(None, "enable NIS for PAM password updates")
+	data = client.recvbuffer(filename)
+	if not data:
+		return False
+
+	result = []
+	for line in str(data).strip().split('\n'):
+		words = line.split()
+		if len(words) > 2 and words[0] == "password" and words[2] == "pam_unix.so":
+			if not "nis" in words:
+				line += " nis"
+		result.append(line)
+	
+	data = '\n'.join(result) + '\n'
+	return client.sendbuffer(filename, data);
+
+##################################################################
+# Change the lookup methods for a nsswitch map
+##################################################################
+def nsswitch_set_method(node, mapname, methods):
+
+	global journal
+
+	journal.beginTest(None, "%s: configure nsswitch %s lookups for \"%s\"" % \
+					(node.name, mapname, methods))
+
+	# Save the original state of nsswitch.conf
+	journal.info("Creating backup of nsswitch.conf if needed")
+	if not client.run("test -f /etc/nsswitch.conf.twpsave"):
+		client.run("cp /etc/nsswitch.conf /etc/nsswitch.conf.twpsave")
+
+	data = node.recvbuffer("/etc/nsswitch.conf")
+	if not data:
+		journal.error("cannot download nsswitch.conf")
+		return False
+
+	result = []
+	for line in str(data).strip().split('\n'):
+		words = line.split(":")
+		if words[0] == mapname:
+			line = "%s: %s" % (mapname, methods)
+		result.append(line)
+
+	data = '\n'.join(result) + '\n'
+	if not client.sendbuffer("/etc/nsswitch.conf", data):
+		journal.error("cannot upload nsswitch.conf")
+		return False
+
+	journal.info("Reloading nscd configuration")
+	client.run("rcnscd restart")
+
+	return True
+
+def nis_build_maps(mapname):
+
+	global journal, nisdomain
+
+	journal.beginTest(None, "rebuild NIS map %s on the server" % mapname)
+	server.run("make -C /var/yp/%s -f /var/yp/Makefile %s" % (nisdomain, mapname))
+
+	journal.info("invalidate cached %s information on the client" % mapname)
+	client.run("nscd -i %s" % mapname)
+
+def nis_verify_map_notempty(mapname):
+
+	global journal, client
+
+	journal.beginTest(None, "Make sure ypcat %s works" % mapname)
+	st = client.runOrFail("ypcat %s" % mapname, quiet = True)
+	if not st:
+		return False
+
+	if not st.stdout:
+		journal.failure("ypcat returned an empty map")
+		return False
+
+	journal.success("ypcat returned map data (%u lines)" % len(str(st.stdout).split('\n')))
+	return True
+
+def nis_verify_ypmatch(mapname, key, value):
+	global journal, client
+
+	journal.beginTest(None, "verify ypmatch %s %s (expect %s)" % (key, mapname, value))
+	st = client.run("ypmatch %s %s" % (key, mapname))
+	if not st:
+		if value:
+			journal.failure("ypmatch reported an error (should have succeeded)")
+			return False
+		journal.success("ypmatch reported an error, as it should")
+		return True
+
+	if not st.stdout:
+		journal.failure("ypmatch returned an empty string")
+		return False
+
+	if value == "notempty":
+		journal.success("ypmatch returned a non-empty string")
+		return True
+
+	if not (value in str(st.stdout)):
+		journal.failure("ypmatch output did not contain %s" % value)
+		return False
+
+	journal.success()
+	return True
+
+
+##################################################################
+# Test NIS host lookups
+##################################################################
+def nis_test_host_lookups(hostname, address):
+	global journal, client, server
+
+	journal.beginGroup("hosts", "Validate host lookup functionality")
+
+	nis_ensure_bound(client)
+
+	# Add a special host entry to the server's hosts file
+	journal.beginTest(None, "Add %s to the server hosts file" % hostname)
+	server.addHostEntry(address, hostname)
+
+	# Now rebuild the hosts maps
+	nis_build_maps("hosts")
+
+	nis_verify_map_notempty("hosts.byname")
+	nis_verify_map_notempty("hosts.byaddr")
+	nis_verify_map_notempty("hosts")
+
+	nis_verify_ypmatch("hosts.byname", hostname, address)
+	nis_verify_ypmatch("hosts.byaddr", address, hostname)
+
+	journal.beginTest(None, "enable NIS hosts lookups in NSS")
+	if not nsswitch_set_method(client, "hosts", "files nis"):
+		return False
+
+	verify_hosts_byname(client, hostname, address)
+	verify_hosts_byaddr(client, address, hostname)
+
+	return True
+
+def verify_hosts_byname(client, hostname, expected_addr):
+
+	journal.beginTest(None, "Verify host lookup of %s" % hostname)
+	st = client.runOrFail("getent hosts %s" % hostname)
+	if not st:
+		journal.failure("getent failed")
+		return False
+	
+	result = str(st.stdout).strip().split('\n')
+	if not result:
+		journal.failure("getent didn't return anything")
+		return False
+
+	for line in result:
+		words = line.split()
+		if words[0] == expected_addr:
+			journal.success()
+			return True
+
+	journal.failure("getent didn't return the expected address %s" % expected_addr)
+	return False
+
+def verify_hosts_byaddr(client, address, expected_hostname):
+
+	journal.beginTest(None, "Verify host lookup of %s" % address)
+	st = client.runOrFail("getent hosts %s" % address)
+	if not st:
+		journal.failure("getent failed")
+		return False
+	
+	result = str(st.stdout).strip().split('\n')
+	if not result:
+		journal.failure("getent didn't return anything")
+		return False
+
+	for line in result:
+		names = line.split()[1:]
+		if expected_hostname in names:
+			journal.success()
+			return True
+
+	journal.failure("getent didn't return the expected hostname %s" % expected_hostname)
+	return False
+
+##################################################################
+# Test NIS user lookups
+##################################################################
+def nis_test_user_lookups(username, uid, password):
+	global journal, client, server
+
+	journal.beginGroup("users", "Validate user lookup functionality")
+
+	nis_ensure_bound(client)
+
+	# Add a special user entry to the server's passwd file
+	journal.beginTest(None, "Add %s to the server passwd file" % username)
+	journal.info("Remove user entry from previous run (if needed)")
+	if server.run("grep -qs ^%s: /etc/passwd" % username):
+		if not server.run("userdel %s" % username):
+			journal.failure("Unable to remove existing user %s on server" % username)
+
+	status = server.run("mkpasswd -m sha-256 \"%s\"" % password)
+	hashpass = str(status.stdout).strip()
+	if not server.run("useradd -M --password '%s' --uid %s %s" % (hashpass, uid, username)):
+		journal.error("unable to create user %s" % username)
+		return False
+
+	# Now rebuild the passwd maps
+	nis_build_maps("passwd")
+	nis_build_maps("group")
+
+	nis_verify_map_notempty("passwd.byname")
+	nis_verify_map_notempty("passwd.byuid")
+	nis_verify_map_notempty("passwd")
+	nis_verify_map_notempty("group.byname")
+	nis_verify_map_notempty("group.bygid")
+	nis_verify_map_notempty("group")
+
+	nis_verify_ypmatch("passwd.byname", username, username + ":")
+	nis_verify_ypmatch("passwd.byuid", uid, username + ":")
+
+	nis_enable_compat_lookups(client, "passwd")
+	nis_enable_compat_lookups(client, "group")
+
+	verify_user_byname(client, username, uid)
+	verify_user_byuid(client, uid, username)
+
+	nis_pam_unix_enable(client, "/etc/pam.d/common-password")
+
+	client.run("ypcat passwd")
+	verify_user_auth(client, username, password)
+	if verify_user_passwd(client, username, password, "S0eL1te!"):
+		client.run("nscd -i passwd")
+		verify_user_auth(client, username, "S0eL1te!", " using the new password")
+
+	journal.beginTest(None, "delete user on server and rebuild maps")
+	server.run("userdel %s" % username)
+	nis_build_maps("passwd")
+	nis_build_maps("group")
+
+	nis_verify_ypmatch("passwd.byname", username, None)
+	nis_verify_ypmatch("passwd.byuid", uid, None)
+
+	return True
+
+def verify_user_byname(client, username, expected_uid):
+
+	journal.beginTest(None, "Verify lookup of user %s" % username)
+	st = client.runOrFail("getent passwd %s" % username)
+	if not st:
+		journal.failure("getent failed")
+		return False
+	
+	result = str(st.stdout).strip().split('\n')
+	if not result:
+		journal.failure("getent didn't return anything")
+		return False
+
+	expected_uid = str(expected_uid)
+	for line in result:
+		words = line.split(':')
+		if len(words) >= 3 and words[2] == expected_uid:
+			journal.success()
+			return True
+
+	journal.failure("getent didn't return the expected uid %s" % expected_uid)
+	return False
+
+def verify_user_byuid(client, uid, expected_username):
+
+	journal.beginTest(None, "Verify lookup of uid %s" % uid)
+	st = client.runOrFail("getent passwd %s" % uid)
+	if not st:
+		journal.failure("getent failed")
+		return False
+	
+	result = str(st.stdout).strip().split('\n')
+	if not result:
+		journal.failure("getent didn't return anything")
+		return False
+
+	for line in result:
+		words = line.split(':')
+		if words[0] == expected_username:
+			journal.success()
+			return True
+
+	journal.failure("getent didn't return the expected username %s" % expected_username)
+	return False
+
+def verify_user_auth(client, username, password, how = ""):
+	journal.beginTest(None, "Try to authenticate as user %s%s" % (username, how))
+
+	command = "pam-test --debug --pam-service login --username %s --password \"%s\" authenticate" % (username, password)
+	return client.runOrFail(command)
+
+def verify_user_passwd(client, username, oldpass, newpass):
+	journal.beginTest(None, "Try to change password for user %s" % username)
+
+	command = "pam-test --debug --pam-service passwd --username %s --old-password \"%s\" --new-password \"%s\" chauthtok" % (username, oldpass, newpass)
+	return client.runOrFail(command)
+
+##################################################################
+# Collection of regression tests
+##################################################################
+def nis_test_regressions():
+	journal.beginGroup("regressions", "Collection of regression tests")
+	nis_test_rpcbind_restart()
+
+def nis_test_rpcbind_restart():
+
+	journal.beginTest(None, "Ensure that rpcbind does not hang in hostname lookups")
+	journal.info("Restarting rpcbind - if this times out, rpcbind gets stuck in NIS calls (which it should avoid)")
+	if not client.runOrFail("systemctl restart rpcbind.service", timeout = 30):
+		return False
+
+	journal.success()
+	return True
+
+##################################################################
+# 
+##################################################################
+def main():
+	setup()
+	nis_init_server(server);
+	nis_init_client(client, server.ipaddr);
+	nis_test_binding(client, server.ipaddr)
+	nis_test_host_lookups("teletubby.testing.suse.org", "8.8.8.8")
+	# nis_test_host_lookups("teletubby6.testing.suse.org", "::2")
+	nis_test_user_lookups("nistest", 6666, "MyPassword")
+
+	nis_test_regressions()
+
+	journal.writeReport()
+
+
+main()
