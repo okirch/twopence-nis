@@ -25,6 +25,7 @@ import sys
 import suselog
 import twopence
 import susetest
+import time
 
 
 journal = None
@@ -471,10 +472,16 @@ def nis_test_user_lookups(username, uid, password):
 	nis_pam_unix_enable(client, "/etc/pam.d/common-password")
 
 	client.run("ypcat passwd")
+
+	# Test that PAM authenticate works
 	verify_user_auth(client, username, password)
-	if verify_user_passwd(client, username, password, "S0eL1te!"):
+
+	# Test that PAM chauthtok works
+	newpass = "S0eL1te="
+	if verify_user_passwd(client, username, password, newpass):
+		time.sleep(2)
 		client.run("nscd -i passwd")
-		verify_user_auth(client, username, "S0eL1te!", " using the new password")
+		verify_user_auth(client, username, newpass, " using the new password")
 
 	journal.beginTest(None, "delete user on server and rebuild maps")
 	server.run("userdel %s" % username)
