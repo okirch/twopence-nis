@@ -1,7 +1,5 @@
 # Client node
 node      client
-repo      slenkins
-repo      updates
 install   rpcbind
 install   ypbind
 install   yp-tools
@@ -9,8 +7,6 @@ install   pam-test-utils
 
 # Server node
 node      server
-repo      slenkins
-repo      updates
 install   rpcbind
 install   ypserv
 # needed for mkpasswd
