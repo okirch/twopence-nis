@@ -300,6 +300,8 @@ def nis_enable_compat_lookups(client, mapname):
 		return False
 
 	journal.beginTest("add + entry to %s" % filename)
+	if not client.run("test -f %s.twpsave" % filename):
+		client.run("cp -av %s %s.twpsave" % (filename, filename))
 	data = client.recvbuffer(filename)
 	if not data:
 		return False
@@ -317,6 +319,21 @@ def nis_enable_compat_lookups(client, mapname):
 
 	data = '\n'.join(result) + '\n'
 	return client.sendbuffer(filename, data);
+
+##################################################################
+# Disable passwd and group compat lookups
+##################################################################
+def nis_disable_compat_lookups(client, mapname):
+
+	global journal
+
+	filename = "/etc/" + mapname
+
+	journal.beginTest("Restore backup of %s" % filename)
+	if client.run("test -f %s.twpsave" % filename):
+		client.run("mv %s.twpsave %s" % (filename, filename))
+
+	return True
 
 ##################################################################
 # Enable password updates through NIS
@@ -593,6 +610,8 @@ def nis_test_user_lookups(username, uid, password):
 
 	nis_verify_ypmatch("passwd.byname", username, None)
 	nis_verify_ypmatch("passwd.byuid", uid, None)
+	nis_disable_compat_lookups(client, "passwd")
+	nis_disable_compat_lookups(client, "group")
 
 	restore_nsswitch(client)
 	journal.finishGroup()
