@@ -10,6 +10,7 @@ install   pam-test-utils
 node      server
 repo	  slenkins-foo
 install   rpcbind
+install	  yp-tools
 install   ypserv
 # needed for mkpasswd
 install   whois

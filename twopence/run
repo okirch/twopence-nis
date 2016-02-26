@@ -32,7 +32,9 @@ journal = None
 client = None
 server = None
 rpcinfo = None
-nisdomain = "nistest.opensuse.org"
+nisdomain = "twopence-nistest"
+nismaster = "nismaster"
+nisclient = "nisclient"
 
 def setup():
 	global client, server, journal
@@ -56,10 +58,12 @@ def setup():
 	if not client.configureOtherNetworks():
 		journal.fatal("Unable to configure additional networks")
 
+	journal.finishGroup()
+
 ##################################################################
-# Start ypserv and run some sanity checks
+# Start NIS master server and run some sanity checks
 ##################################################################
-def nis_init_server(server):
+def nis_init_master_server(server):
 	global journal
 
 	journal.beginGroup("init-%s" % server.name, "initialize server")
@@ -71,11 +75,14 @@ def nis_init_server(server):
 		return False
 
 	journal.info("Set the host name to nismaster")
-	server.addHostEntry(server.ipaddr, "nismaster.testing.suse.org")
-	server.run("hostname nismaster")
+	server.addHostEntry(server.ipaddr, nismaster)
+	if (server.ipv6_addr):
+		server.addHostEntry(server.ipv6_addr, nismaster)
+	server.run("hostname %s" % nismaster)
 
-	journal.beginTest("building default NIS maps")
-	if not server.runOrFail("make -C /var/yp"):
+	journal.beginTest("start rpcbind")
+	if not server.runOrFail("systemctl enable rpcbind.socket") or \
+	   not server.runOrFail("systemctl start rpcbind.socket"):
 		return False
 
 	journal.beginTest("starting ypserv")
@@ -94,12 +101,44 @@ def nis_init_server(server):
 	if not server.runOrFail("rpcinfo -u localhost yppasswdd"):
 		return False
 
+	# Build maps after server was started to avoid lot of error
+	# messages in output
+	journal.beginTest("building default NIS maps")
+	if not server.runOrFail("make -C /var/yp"):
+		return False
+
+	journal.finishGroup()
+
+##################################################################
+# Stop NIS master server
+##################################################################
+def nis_stop_master_server(server):
+	global journal
+
+	journal.beginGroup("stop-%s" % server.name, "stop master server")
+
+	journal.beginTest("stoping yppasswdd")
+	if not server.runOrFail("rcyppasswdd stop"):
+		return False
+
+	journal.beginTest("Removing default NIS maps")
+	if not server.runOrFail("rm -rf  /var/yp/" + nisdomain):
+		return False
+
+	journal.beginTest("stoping ypserv")
+	if not server.runOrFail("rcypserv stop"):
+		return False
+
+	journal.beginTest("stop", "disable rpcbind on server")
+	server.runOrFail("/usr/bin/systemctl disable rpcbind.socket")
+	server.runOrFail("/usr/bin/systemctl stop rpcbind.socket")
+
 	journal.finishGroup()
 
 ##################################################################
 # Start ypbind and run some sanity checks
 ##################################################################
-def nis_init_client(client, serverip):
+def nis_init_client(client, server):
 	global journal
 
 	journal.beginGroup("init-%s" % client.name, "initialize client")
@@ -115,20 +154,51 @@ def nis_init_client(client, serverip):
 
 	journal.beginTest("Preparing configuration")
 
-	journal.info("Set NIS domain to %s" % nisdomain)
+	journal.info("Set NIS domain to %s (/etc/defaultdomain)" % nisdomain)
 	if not client.sendbuffer("/etc/defaultdomain", nisdomain):
 		return False
 
-	journal.info("Set the host name to nismaster")
-	client.addHostEntry(serverip, "nismaster.testing.suse.org")
+	journal.info("set the NIS domain to %s (nisdomainname)" % nisdomain)
+	if not client.runOrFail("nisdomainname '%s'" % nisdomain):
+		return False
+
+	journal.info("Add hostnames of master to /etc/hosts")
+	client.addHostEntry(server.ipaddr, nismaster)
+	if (server.ipv6_addr):
+		client.addHostEntry(server.ipaddr, nismaster)
 
 	client.nisBound = False
-	return True
+	journal.finishGroup()
+
+##################################################################
+# Stop ypbind
+##################################################################
+def nis_stop_client(client):
+	global journal
+
+	journal.beginGroup("stop-%s" % client.name, "stop client")
+
+	journal.beginTest("stoping ypbind")
+	if not client.runOrFail("rcypbind stop"):
+		return False
+
+	journal.beginTest("stop rpcbind")
+	if not client.runOrFail("systemctl disable rpcbind.socket") or \
+	   not client.runOrFail("systemctl stop rpcbind.socket"):
+		return False
+
+	journal.beginTest("Removing configuration")
+
+	journal.info("Remove NIS domain")
+	if not client.sendbuffer("/etc/defaultdomain", ""):
+		return False
+
+	journal.finishGroup()
 
 ##################################################################
 # Test various ways to configure ypbind
 ##################################################################
-def nis_test_binding(client, serverip):
+def nis_test_binding(client,server):
 
 	global nisdomain
 
@@ -137,15 +207,26 @@ def nis_test_binding(client, serverip):
 	list = []
 	list.append("domain %s broadcast" % nisdomain)
 	list.append("broadcast")
-	list.append("domain %s server %s" % (nisdomain, serverip))
-	list.append("ypserver %s" % serverip)
+	list.append("domain %s server %s" % (nisdomain, server.ipaddr))
+	list.append("domain %s server %s" % (nisdomain, nismaster))
+	list.append("ypserver %s" % server.ipaddr)
+	list.append("ypserver %s" % nismaster)
+	if server.ipv6_addr:
+		list.append("domain %s server %s" % (nisdomain, server.ipv6_addr))
+		list.append("ypserver %s" % server.ipv6_addr)
 
 	for ypconf in list:
 		journal.beginTest("validate binding when using \"%s\"" % ypconf)
-		nis_configure_binding(client, ypconf, serverip)
+		nis_configure_binding(client, ypconf)
+		# Not more then 5 restarts in 10 seconds, else systemd will go crazy :(
+		time.sleep (2)
 
 	# TBD: use "ypwhich -m rpc" and verify that the name of the master
 	# returned is nismaster.testing.suse.de
+
+	client.runOrFail("rcypbind stop")
+	client.nisBound = False
+	journal.finishGroup()
 
 def nis_ensure_bound(client):
 
@@ -153,21 +234,19 @@ def nis_ensure_bound(client):
 		return True
 
 	journal.beginTest("binding client to NIS server")
-	ypconf = "domain %s server %s" % (nisdomain, serverip)
-	nis_configure_binding(client, ypconf, serverip)
+	ypconf = "domain %s server %s" % (nisdomain, nismaster)
+	nis_configure_binding(client, ypconf)
 
 	return client.nisBound
 
 ##################################################################
 # Update yp.conf and rebind
 ##################################################################
-def nis_configure_binding(client, ypconf, serverip):
+def nis_configure_binding(client, ypconf):
 
 	journal.info("Updating yp.conf")
 	if not client.sendbuffer("/etc/yp.conf", ypconf):
 		return False
-
-	# FIXME: do we need to clean out the binding directory?
 
 	journal.info("Restart ypbind")
 	client.nisBound = False
@@ -177,7 +256,7 @@ def nis_configure_binding(client, ypconf, serverip):
 	journal.info("Verify client binding")
 	bound = None
 	for i in range(1, 120/5):
-		st = client.run("ypwhich")
+		st = client.run("ypwhich -d %s" % nisdomain)
 		if not st:
 			journal.failure("ypwhich failed")
 			return False
@@ -186,7 +265,7 @@ def nis_configure_binding(client, ypconf, serverip):
 		if bound:
 			break
 
-		time.slep(5)
+		time.sleep(5)
 
 	if not bound:
 		journal.failure("failed to bind to server")
@@ -208,7 +287,7 @@ def nis_configure_binding(client, ypconf, serverip):
 # Enable passwd and group compat lookups
 ##################################################################
 def nis_enable_compat_lookups(client, mapname):
-	
+
 	global journal
 
 	filename = "/etc/" + mapname
@@ -229,7 +308,7 @@ def nis_enable_compat_lookups(client, mapname):
 			journal.success("%s already contains a line starting with +" % filename);
 			return True
 		result.append(line)
-	
+
 	result.append("+")
 
 	data = '\n'.join(result) + '\n'
@@ -254,7 +333,7 @@ def nis_pam_unix_enable(client, filename):
 			if not "nis" in words:
 				line += " nis"
 		result.append(line)
-	
+
 	data = '\n'.join(result) + '\n'
 	return client.sendbuffer(filename, data);
 
@@ -271,7 +350,7 @@ def nsswitch_set_method(node, mapname, methods):
 	# Save the original state of nsswitch.conf
 	journal.info("Creating backup of nsswitch.conf if needed")
 	if not client.run("test -f /etc/nsswitch.conf.twpsave"):
-		client.run("cp /etc/nsswitch.conf /etc/nsswitch.conf.twpsave")
+		client.run("cp -p /etc/nsswitch.conf /etc/nsswitch.conf.twpsave")
 
 	data = node.recvbuffer("/etc/nsswitch.conf")
 	if not data:
@@ -289,6 +368,25 @@ def nsswitch_set_method(node, mapname, methods):
 	if not client.sendbuffer("/etc/nsswitch.conf", data):
 		journal.error("cannot upload nsswitch.conf")
 		return False
+
+	journal.info("Reloading nscd configuration")
+	client.run("rcnscd restart")
+
+	return True
+
+##################################################################
+# Restore the lookup methods of nsswitch for all services
+##################################################################
+def restore_nsswitch(node):
+
+	global journal
+
+	journal.beginTest("%s: restore nsswitch" % (node.name))
+
+	# Save the original state of nsswitch.conf
+	journal.info("Restore backup of nsswitch.conf if needed")
+	if client.run("test -f /etc/nsswitch.conf.twpsave"):
+		client.run("mv /etc/nsswitch.conf.twpsave /etc/nsswitch.conf")
 
 	journal.info("Reloading nscd configuration")
 	client.run("rcnscd restart")
@@ -380,7 +478,8 @@ def nis_test_host_lookups(hostname, address):
 	verify_hosts_byname(client, hostname, address)
 	verify_hosts_byaddr(client, address, hostname)
 
-	return True
+	restore_nsswitch(client)
+	journal.finishGroup()
 
 def verify_hosts_byname(client, hostname, expected_addr):
 
@@ -389,7 +488,7 @@ def verify_hosts_byname(client, hostname, expected_addr):
 	if not st:
 		journal.failure("getent failed")
 		return False
-	
+
 	result = str(st.stdout).strip().split('\n')
 	if not result:
 		journal.failure("getent didn't return anything")
@@ -411,7 +510,7 @@ def verify_hosts_byaddr(client, address, expected_hostname):
 	if not st:
 		journal.failure("getent failed")
 		return False
-	
+
 	result = str(st.stdout).strip().split('\n')
 	if not result:
 		journal.failure("getent didn't return anything")
@@ -491,7 +590,8 @@ def nis_test_user_lookups(username, uid, password):
 	nis_verify_ypmatch("passwd.byname", username, None)
 	nis_verify_ypmatch("passwd.byuid", uid, None)
 
-	return True
+	restore_nsswitch(client)
+	journal.finishGroup()
 
 def verify_user_byname(client, username, expected_uid):
 
@@ -500,7 +600,7 @@ def verify_user_byname(client, username, expected_uid):
 	if not st:
 		journal.failure("getent failed")
 		return False
-	
+
 	result = str(st.stdout).strip().split('\n')
 	if not result:
 		journal.failure("getent didn't return anything")
@@ -523,7 +623,7 @@ def verify_user_byuid(client, uid, expected_username):
 	if not st:
 		journal.failure("getent failed")
 		return False
-	
+
 	result = str(st.stdout).strip().split('\n')
 	if not result:
 		journal.failure("getent didn't return anything")
@@ -556,6 +656,7 @@ def verify_user_passwd(client, username, oldpass, newpass):
 def nis_test_regressions():
 	journal.beginGroup("regressions", "Collection of regression tests")
 	nis_test_rpcbind_restart()
+	journal.finishGroup()
 
 def nis_test_rpcbind_restart():
 
@@ -568,18 +669,20 @@ def nis_test_rpcbind_restart():
 	return True
 
 ##################################################################
-# 
+#
 ##################################################################
 def main():
 	setup()
-	nis_init_server(server);
-	nis_init_client(client, server.ipaddr);
-	nis_test_binding(client, server.ipaddr)
+	nis_init_master_server(server);
+	nis_init_client(client, server);
+	nis_test_binding(client, server)
 	nis_test_host_lookups("teletubby.testing.suse.org", "8.8.8.8")
 	# nis_test_host_lookups("teletubby6.testing.suse.org", "::2")
 	nis_test_user_lookups("nistest", 6666, "MyPassword")
-
 	nis_test_regressions()
+
+	nis_stop_client(client)
+	nis_stop_master_server(server)
 
 	journal.writeReport()
 
