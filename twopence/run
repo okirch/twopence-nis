@@ -53,6 +53,11 @@ def setup():
 	if not server.ipaddr:
 		journal.fatal("No IP address set for server");
 
+	if server.ipv6_addr:
+		journal.info("IPv6 tests enabled")
+	else:
+		journal.info("IPv6 tests disabled")
+
 	if not server.configureOtherNetworks():
 		journal.fatal("Unable to configure additional networks")
 	if not client.configureOtherNetworks():
@@ -284,10 +289,10 @@ def nis_test_binding(client,server):
 	list.append("domain %s broadcast" % nisdomain)
 	list.append("broadcast")
 	list.append("domain %s server %s" % (nisdomain, server.ipaddr))
-	list.append("domain %s server %s" % (nisdomain, nismaster))
 	list.append("ypserver %s" % server.ipaddr)
-	list.append("ypserver %s" % nismaster)
 	if server.ipv6_addr:
+		list.append("domain %s server %s" % (nisdomain, nismaster))
+		list.append("ypserver %s" % nismaster)
 		list.append("domain %s server %s" % (nisdomain, server.ipv6_addr))
 		list.append("ypserver %s" % server.ipv6_addr)
 
@@ -304,13 +309,16 @@ def nis_test_binding(client,server):
 	client.nisBound = False
 	journal.finishGroup()
 
-def nis_ensure_bound(client):
+def nis_ensure_bound(client,server):
 
 	if client.nisBound:
 		return True
 
 	journal.beginTest("binding client to NIS server")
-	ypconf = "domain %s server %s" % (nisdomain, nismaster)
+	if (server.ipv6_addr):
+		ypconf = "domain %s server %s" % (nisdomain, nismaster)
+	else:
+		ypconf = "domain %s server %s" % (nisdomain, server.ipv4_addr)
 	nis_configure_binding(client, ypconf)
 
 	return client.nisBound
@@ -563,7 +571,7 @@ def nis_test_host_lookups(hostname, address):
 
 	journal.beginGroup("hosts", "Validate host lookup functionality")
 
-	nis_ensure_bound(client)
+	nis_ensure_bound(client,server)
 
 	# Add a special host entry to the server's hosts file
 	journal.beginTest("Add %s to the server hosts file" % hostname)
@@ -641,7 +649,7 @@ def nis_test_user_lookups(username, uid, password):
 
 	journal.beginGroup("users", "Validate user lookup functionality")
 
-	nis_ensure_bound(client)
+	nis_ensure_bound(client,server)
 
 	# Add a special user entry to the server's passwd file
 	journal.beginTest("Add %s to the server passwd file" % username)
