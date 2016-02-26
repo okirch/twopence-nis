@@ -78,6 +78,7 @@ def nis_init_master_server(server):
 	server.addHostEntry(server.ipaddr, nismaster)
 	if (server.ipv6_addr):
 		server.addHostEntry(server.ipv6_addr, nismaster)
+	server.run("hostname > /etc/hostname.tpsave")
 	server.run("hostname %s" % nismaster)
 
 	journal.beginTest("start rpcbind")
@@ -132,6 +133,9 @@ def nis_stop_master_server(server):
 	journal.beginTest("stop", "disable rpcbind on server")
 	server.runOrFail("/usr/bin/systemctl disable rpcbind.socket")
 	server.runOrFail("/usr/bin/systemctl stop rpcbind.socket")
+
+	server.run("hostname `cat /etc/hostname.tpsave`")
+	server.run("rm -f /etc/hostname.tpsave")
 
 	journal.finishGroup()
 
