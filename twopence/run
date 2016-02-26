@@ -139,6 +139,78 @@ def nis_stop_master_server(server):
 
 	journal.finishGroup()
 
+
+##################################################################
+# Start slave ypserv and run some sanity checks
+##################################################################
+def nis_init_slave_server(slave):
+	global journal
+
+	journal.beginGroup("init-slave-%s" % slave.name, "initialize NIS slave server")
+
+	journal.beginTest("Preparing configuration")
+
+	#journal.info("set the NIS domain to %s" % nisdomain)
+	#if not server.runOrFail("nisdomainname '%s'" % nisdomain):
+	#        return False
+
+	# Remove old stuff
+	journal.beginTest("Removing old NIS maps")
+	if not slave.runOrFail("rm -rf  /var/yp/" + nisdomain):
+		return False
+
+	journal.beginTest("starting ypserv")
+	if not slave.runOrFail("rcypserv start"):
+		return False
+
+	journal.beginTest("ensure ypserv is running")
+	if not slave.runOrFail("rpcinfo -u localhost ypserv"):
+		return False
+
+	# Fetch initial maps from master server
+	journal.beginTest("fetch default maps")
+	if not slave.runOrFail("/usr/lib/yp/ypinit -s %s" % nismaster):
+		return False
+
+	nis_verify_maps_exist(slave)
+
+	journal.finishGroup()
+
+def nis_verify_maps_exist(slave):
+
+	global journal;
+
+	journal.beginTest("Make sure yphelper -m [nismaster] shows output")
+	st = client.runOrFail("/usr/lib/yp/yphelper -m %s" % nismaster, quiet = True)
+	if not st:
+		return False
+
+	if not st.stdout:
+		journal.failure("yphelper returned an empty list")
+		return False
+
+	journal.success("yphelper returned map list (%u lines)" % len(str(st.stdout).split('\n')))
+	return True
+
+
+##################################################################
+# Stop ypserv on slave
+##################################################################
+def nis_stop_slave_server(slave):
+	global journal
+
+	journal.beginGroup("stop-slave-%s" % slave.name, "stop slave server")
+
+	journal.beginTest("Removing slave NIS maps")
+	if not server.runOrFail("rm -rf  /var/yp/" + nisdomain):
+		return False
+
+	journal.beginTest("stoping ypserv")
+	if not server.runOrFail("rcypserv stop"):
+		return False
+
+	journal.finishGroup()
+
 ##################################################################
 # Start ypbind and run some sanity checks
 ##################################################################
@@ -169,7 +241,7 @@ def nis_init_client(client, server):
 	journal.info("Add hostnames of master to /etc/hosts")
 	client.addHostEntry(server.ipaddr, nismaster)
 	if (server.ipv6_addr):
-		client.addHostEntry(server.ipaddr, nismaster)
+		client.addHostEntry(server.ipv6_addr, nismaster)
 
 	client.nisBound = False
 	journal.finishGroup()
@@ -286,6 +358,21 @@ def nis_configure_binding(client, ypconf):
 	journal.success("Successfully bound to %s" % bound)
 	client.nisBound = True
 	return True
+
+def nis_switch_client_to_localhost(client, server):
+	global nisdomain
+
+	journal.beginGroup("localhost-%s" % client.name, "change yp.conf to localhost on %s" % client.name)
+
+	if server.ipv6_addr:
+		ypconf = "domain %s server localhost" % (nisdomain)
+	else:
+		ypconf = "domain %s server 127.0.0.1" % (nisdomain)
+
+	nis_configure_binding(client, ypconf)
+
+	journal.finishGroup()
+
 
 ##################################################################
 # Enable passwd and group compat lookups
@@ -704,7 +791,11 @@ def main():
 	nis_test_user_lookups("nistest", 6666, "MyPassword")
 	nis_test_regressions()
 
+	nis_init_slave_server(client)
+	nis_switch_client_to_localhost(client, server)
+
 	nis_stop_client(client)
+	nis_stop_slave_server(client)
 	nis_stop_master_server(server)
 
 	journal.writeReport()
