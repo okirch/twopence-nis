@@ -774,6 +774,7 @@ def verify_user_passwd(client, username, oldpass, newpass):
 def nis_test_regressions():
 	journal.beginGroup("regressions", "Collection of regression tests")
 	nis_test_rpcbind_restart()
+	yppoll_and_domain_not_bound()
 	journal.finishGroup()
 
 def nis_test_rpcbind_restart():
@@ -785,6 +786,27 @@ def nis_test_rpcbind_restart():
 
 	journal.success()
 	return True
+
+def yppoll_and_domain_not_bound():
+	journal.beginTest("Ensure that yppoll does not crash if domain is not bound")
+	journal.info("Configure ypbind to invalid host/domain")
+
+	client.nisBound = False;
+	if not client.sendbuffer("/etc/yp.conf", "domain none-ignore server 127.0.0.1"):
+		return False
+
+	journal.info("Restart ypbind")
+	if not client.runOrFail("rcypbind restart"):
+		return False
+
+	st = client.run("yppoll passwd.byname", quiet=True)
+	if (st.code > 256):
+		journal.failure("yppoll crashed: %s" % st.code)
+		return False
+
+	journal.success()
+	return True
+
 
 ##################################################################
 #
