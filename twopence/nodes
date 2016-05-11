@@ -3,6 +3,7 @@ node      client
 repo	  slenkins-foo
 install   rpcbind
 install   ypbind
+install   ypserv
 install   yp-tools
 install   pam-test-utils
 
