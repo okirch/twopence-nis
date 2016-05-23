@@ -1,0 +1,16 @@
+{
+  "name": "twopence-nis",
+  "summary": "Test suite for NIS",
+  "description": "SLEnkins test suite for NIS yellow pages.",
+  "status": "ready",
+  "maintainer": ["Olaf Kirch <okirch@suse.com>"],
+  "rpm": ["twopence-nis", "twopence-nis-control"],
+  "arch": ["noarch"],
+  "product": "nis",
+  "fate": null,
+  "bnc": null,
+  "updated_at": "2016-03-14 15:53:00 UTC",
+  "tags": ["slenkins"],
+  "nodes": ["client", "server"],
+  "incompatible": []
+}
